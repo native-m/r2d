@@ -87,7 +87,16 @@ static R2DFixed32 r2d_iround(const double x) {
     __m128d sign = _mm_set_sd(-0.0);
     __m128d msk = _mm_cmple_sd(sd, _mm_setzero_pd());
     __m128d half = _mm_or_pd(_mm_and_pd(sign, msk), _mm_set_sd(0.5));
-    return _mm_cvtsd_si32(_mm_add_sd(sd, half));
+    return _mm_cvttsd_si32(_mm_add_sd(sd, half));
+}
+
+R2D_FORCEINLINE
+static R2DFixed32 r2d_iround(const float x) {
+    __m128 sd = _mm_load_ss(&x);
+    __m128 sign = _mm_set_ss(-0.0f);
+    __m128 msk = _mm_cmple_ss(sd, _mm_setzero_ps());
+    __m128 half = _mm_or_ps(_mm_and_ps(sign, msk), _mm_set_ss(0.5f));
+    return _mm_cvtt_ss2si(_mm_add_ss(sd, half));
 }
 
 R2D_FORCEINLINE
