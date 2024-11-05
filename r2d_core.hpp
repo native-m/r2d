@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <emmintrin.h>
+#include <limits>
 #include <memory>
 #include <xmmintrin.h>
 
@@ -33,7 +34,7 @@ using R2DFixed32 = int32_t;
 using R2DPixel = uint32_t;
 using R2DColor8 = uint32_t;
 
-struct R2DColorBitPos {
+struct R2DColorBitShift {
     uint32_t r;
     uint32_t g;
     uint32_t b;
@@ -45,6 +46,12 @@ struct R2DBox {
     float y0;
     float x1;
     float y1;
+};
+
+struct R2DIntersection {
+    float x;
+    float y;
+    uint32_t flag;
 };
 
 template <typename T>
@@ -60,15 +67,9 @@ struct R2DVector {
             std::free(data_);
     }
 
-    inline void resize(size_t capacity)
-    {
+    inline void resize(size_t capacity) {}
 
-    }
-
-    inline void reserve(size_t capacity)
-    {
-
-    }
+    inline void reserve(size_t capacity) {}
 };
 
 template <typename T>
@@ -78,7 +79,12 @@ static T r2d_max(T a, T b) {
 
 template <typename T>
 static T r2d_min(T a, T b) {
-    return (b > a) ? b : a;
+    return (b > a) ? a : b;
+}
+
+template <typename T>
+static T r2d_clamp(T x, T min_val, T max_val) {
+    return r2d_min(r2d_max(x, min_val), max_val);
 }
 
 R2D_FORCEINLINE
@@ -138,6 +144,10 @@ static void r2d_copy_image(R2DColor8* dst_image, uint32_t dst_stride, uint32_t d
         uint32_t src_pos = src_stride * (i + src_y) + src_x;
         std::memcpy(dst_image + dst_pos, src_image + src_pos, width * sizeof(R2DColor8));
     }
+}
+
+R2D_FORCEINLINE static uint32_t r2d_clipping_flag_y(const float y, const R2DBox& box) {
+    return ((y < box.y0) << 1) | ((y > box.y1) << 3);
 }
 
 R2D_FORCEINLINE
@@ -201,8 +211,8 @@ static R2DColor8 r2d_separate_alpha(R2DColor8 color, uint32_t r_shift, uint32_t 
 }
 
 struct R2DBlendSrcOver {
-    inline R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
-                                uint32_t dst_a, uint32_t& out_alpha) {
+    R2D_FORCEINLINE R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
+                                         uint32_t dst_a, uint32_t& out_alpha) {
         uint32_t dst_alpha_factor = r2d_fpmul(dst_a, 255 - src_a);
         uint32_t dst = r2d_rgb_alphamult(dst_col, dst_alpha_factor);
         uint32_t src = r2d_rgb_alphamult(src_col, src_a);
@@ -214,8 +224,8 @@ struct R2DBlendSrcOver {
 };
 
 struct R2DBlendSrcAtop {
-    inline R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
-                                uint32_t dst_a, uint32_t& out_alpha) noexcept {
+    R2D_FORCEINLINE R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
+                                         uint32_t dst_a, uint32_t& out_alpha) noexcept {
         uint32_t src_alpha_factor = r2d_fpmul(src_a, dst_a);
         uint32_t dst_alpha_factor = r2d_fpmul(dst_a, 255 - src_a);
         uint32_t src = r2d_rgb_alphamult(src_col, src_alpha_factor);
@@ -228,8 +238,8 @@ struct R2DBlendSrcAtop {
 };
 
 struct R2DBlendSrcIn {
-    R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col, uint32_t dst_a,
-                         uint32_t& out_alpha) noexcept {
+    R2D_FORCEINLINE R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
+                                         uint32_t dst_a, uint32_t& out_alpha) noexcept {
         uint32_t alpha = r2d_fpmul(src_a, dst_a);
         uint32_t alpha_rcp = r2d_alpharcp(alpha);
         uint32_t src = r2d_rgb_alphamult(src_col, alpha);
@@ -239,8 +249,8 @@ struct R2DBlendSrcIn {
 };
 
 struct R2DBlendSrcOut {
-    R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col, uint32_t dst_a,
-                         uint32_t& out_alpha) noexcept {
+    R2D_FORCEINLINE R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
+                                         uint32_t dst_a, uint32_t& out_alpha) noexcept {
         uint32_t alpha = r2d_fpmul(src_a, 255 - dst_a);
         uint32_t alpha_rcp = r2d_alpharcp(alpha);
         uint32_t src = r2d_rgb_alphamult(src_col, alpha);
@@ -250,16 +260,16 @@ struct R2DBlendSrcOut {
 };
 
 struct R2DBlendSrcCopy {
-    R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col, uint32_t dst_a,
-                         uint32_t& out_alpha) noexcept {
+    R2D_FORCEINLINE R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
+                                         uint32_t dst_a, uint32_t& out_alpha) noexcept {
         out_alpha = src_a;
         return 0;
     }
 };
 
 struct R2DBlendDstOver {
-    R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col, uint32_t dst_a,
-                         uint32_t& out_alpha) noexcept {
+    R2D_FORCEINLINE R2DColor8 operator()(R2DColor8 src_col, uint32_t src_a, R2DColor8 dst_col,
+                                         uint32_t dst_a, uint32_t& out_alpha) noexcept {
         uint32_t src_alpha_factor = r2d_fpmul(dst_a, 255 - src_a);
         uint32_t dst = r2d_rgb_alphamult(dst_col, dst_a);
         uint32_t src = r2d_rgb_alphamult(src_col, src_a);

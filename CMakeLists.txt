@@ -38,8 +38,4 @@ target_sources(r2d INTERFACE
 target_include_directories(r2d INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(r2d INTERFACE cxx_std_17)
 
-add_executable(r2d_example2 "r2d_example.cpp")
-target_link_libraries(r2d_example2 r2d stb_image_write)
-target_compile_features(r2d_example2 PUBLIC cxx_std_17)
-
 add_subdirectory(examples)

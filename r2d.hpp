@@ -65,7 +65,49 @@ enum class R2DContextFlags {
 struct R2DPoint {
     float x;
     float y;
+
+    float length_sq() const { return (x * x) + (y * y); }
 };
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator+(const R2DPoint& a, const R2DPoint& b) {
+    return R2DPoint{a.x + b.x, a.y + b.y};
+}
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator-(const R2DPoint& a, const R2DPoint& b) {
+    return R2DPoint{a.x - b.x, a.y - b.y};
+}
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator*(const R2DPoint& a, const R2DPoint& b) {
+    return R2DPoint{a.x * b.x, a.y * b.y};
+}
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator/(const R2DPoint& a, const R2DPoint& b) {
+    return R2DPoint{a.x / b.x, a.y / b.y};
+}
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator+(const R2DPoint& a, const float b) {
+    return R2DPoint{a.x + b, a.y + b};
+}
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator-(const R2DPoint& a, const float b) {
+    return R2DPoint{a.x - b, a.y - b};
+}
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator*(const R2DPoint& a, const float b) {
+    return R2DPoint{a.x * b, a.y * b};
+}
+
+R2D_FORCEINLINE
+static constexpr R2DPoint operator/(const R2DPoint& a, const float b) {
+    return R2DPoint{a.x / b, a.y / b};
+}
 
 struct R2DRect {
     float x;
@@ -73,6 +115,22 @@ struct R2DRect {
     float w;
     float h;
 };
+
+R2D_FORCEINLINE
+static constexpr R2DColorBitShift r2d_color_bitshift(R2DPixelFormat format) noexcept {
+    // Color bit position table for format conversion
+    switch (format) {
+        case R2DPixelFormat::RGBA8:
+            return {0, 8, 16, 24};
+        case R2DPixelFormat::ARGB8:
+            return {8, 16, 24, 0};
+        case R2DPixelFormat::BGRA8:
+            return {16, 8, 0, 24};
+        default:
+            R2D_UNREACHABLE();
+    }
+    return {};
+}
 
 struct R2DColor {
     float r = 0.0f, g = 0.0f, b = 0.0f, a = 0.0f;
@@ -112,10 +170,10 @@ struct R2DColor {
 
     R2D_FORCEINLINE
     R2DColor8 to_bytes(R2DPixelFormat fmt) const noexcept {
-        uint32_t u_r = (uint32_t)std::round(r * 255.0f);
-        uint32_t u_g = (uint32_t)std::round(g * 255.0f);
-        uint32_t u_b = (uint32_t)std::round(b * 255.0f);
-        uint32_t u_a = (uint32_t)std::round(a * 255.0f);
+        uint32_t u_r = r2d_iround(r * 255.0f);
+        uint32_t u_g = r2d_iround(g * 255.0f);
+        uint32_t u_b = r2d_iround(b * 255.0f);
+        uint32_t u_a = r2d_iround(a * 255.0f);
 
         switch (fmt) {
             case R2DPixelFormat::RGBA8:
@@ -432,6 +490,7 @@ struct R2DImage {
     R2DPixelFormat format() const { return format_; }
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
+    R2DRect rect() const noexcept { return R2DRect{0.0f, 0.0f, (float)width_, (float)height_}; }
     void* raw_data() const { return data_; }
     operator bool() const noexcept { return data_ != nullptr; }
 };
@@ -442,11 +501,22 @@ struct R2DCell {
     int32_t area;
 };
 
+struct R2DSpan {
+    uint32_t x0;
+    uint32_t x1;
+};
+
 struct R2DRaster {
     R2DCell* cells_{};
+    R2DSpan* spans_{};
     uint32_t width_{};
     uint32_t height_{};
     uint32_t stride_{};
+
+    int32_t min_x_{};
+    int32_t min_y_{};
+    int32_t max_x_{};
+    int32_t max_y_{};
 
     // The generation counter optimizes how often the R2DRaster will be discarded.
     // R2DRaster will be discarded/cleared only if the generation counter overflowed.
@@ -458,6 +528,7 @@ struct R2DRaster {
 
     R2DRaster(R2DRaster&& other) noexcept :
         cells_(std::exchange(other.cells_, nullptr)),
+        spans_(std::exchange(other.spans_, nullptr)),
         width_(std::exchange(other.width_, 0)),
         height_(std::exchange(other.height_, 0)),
         stride_(std::exchange(other.stride_, 0)),
@@ -467,17 +538,24 @@ struct R2DRaster {
     ~R2DRaster() {
         if (cells_)
             std::free(cells_);
+        if (spans_)
+            std::free(spans_);
         width_ = 0;
         height_ = 0;
     }
 
     R2DRaster& operator=(R2DRaster&& other) noexcept {
         cells_ = std::exchange(other.cells_, nullptr);
+        spans_ = std::exchange(other.spans_, nullptr);
         width_ = std::exchange(other.width_, 0);
         height_ = std::exchange(other.height_, 0);
         stride_ = std::exchange(other.stride_, 0);
         prev_gen_ = std::exchange(other.prev_gen_, 0);
         current_gen_ = std::exchange(other.current_gen_, 0);
+        min_x_ = std::exchange(other.min_x_, 0);
+        min_y_ = std::exchange(other.min_y_, 0);
+        max_x_ = std::exchange(other.max_x_, 0);
+        max_y_ = std::exchange(other.max_y_, 0);
         return *this;
     }
 
@@ -489,20 +567,38 @@ struct R2DRaster {
         R2DCell* new_cells = (R2DCell*)std::malloc(size);
         if (!new_cells)
             return false;
+        R2DSpan* new_spans = (R2DSpan*)std::malloc(height * sizeof(R2DSpan));
+        if (!new_spans) {
+            std::free(new_cells);
+            return false;
+        }
         if (cells_)
             std::free(cells_);
+        if (spans_)
+            std::free(spans_);
         std::memset(new_cells, 0, size);
+        std::memset(new_spans, 0, height * sizeof(R2DSpan));
         cells_ = new_cells;
+        spans_ = new_spans;
         stride_ = stride;
         width_ = width;
         height_ = height;
+        min_x_ = width_;
+        min_y_ = height_;
+        max_x_ = 0;
+        max_y_ = 0;
         return true;
     }
 
     void clear() {
         std::memset(cells_, 0, stride_ * height_ * sizeof(R2DCell));
+        std::memset(spans_, 0, height_ * sizeof(R2DSpan));
         current_gen_ = 0;
         prev_gen_ = 0;
+        min_x_ = width_;
+        min_y_ = height_;
+        max_x_ = 0;
+        max_y_ = 0;
     }
 
     R2DRaster clone() {
@@ -510,13 +606,15 @@ struct R2DRaster {
         if (!raster.init(width_, height_))
             return raster;
         std::memcpy(raster.cells_, cells_, stride_ * height_ * sizeof(R2DCell));
+        std::memcpy(raster.spans_, spans_, height_ * sizeof(R2DSpan));
         return raster;
     }
 
     uint32_t width() const noexcept { return width_; }
     uint32_t stride() const noexcept { return stride_; }
     uint32_t height() const noexcept { return height_; }
-    operator bool() const noexcept { return cells_ != nullptr; }
+    R2DRect rect() const noexcept { return R2DRect{0.0f, 0.0f, (float)width_, (float)height_}; }
+    operator bool() const noexcept { return cells_ != nullptr && spans_ != nullptr; }
 };
 
 struct R2DPath {
@@ -543,7 +641,7 @@ struct R2DPath {
 
 struct R2DContext {
     R2DImage* rt_{};
-    R2DColorBitPos rt_bitpos_{};
+    R2DColorBitShift rt_bitpos_{};
     R2DRaster* raster_{};
     const R2DSource* source_{};
     R2DBlendMode blend_mode_{};
@@ -557,7 +655,11 @@ struct R2DContext {
     uint32_t p0_clip{};
     bool p0_inside = false;
 
-    R2DPoint clip_stack[3]{};
+    R2DIntersection clip_stack[3]{};
+    R2DIntersection clip_x0_{};
+    R2DIntersection clip_x1_{};
+    uint32_t clip_flag_x0_{};
+    uint32_t clip_flag_x1_{};
     uint32_t clip_stack_pos{};
 
     R2DVector<R2DPoint> tmp_line_normals_;
@@ -569,18 +671,10 @@ struct R2DContext {
 
     void set_render_target(R2DImage* image) noexcept {
         rt_ = image;
-        rt_bitpos_ = color_bitpos_(image->format_);
+        rt_bitpos_ = r2d_color_bitshift(image->format_);
     }
 
-    void set_raster(R2DRaster* raster) noexcept {
-        if (!raster_) {
-            clip_box_.x0 = 0;
-            clip_box_.y0 = 0;
-            clip_box_.x1 = (float)(raster->width_);
-            clip_box_.y1 = (float)(raster->height_);
-        }
-        raster_ = raster;
-    }
+    void set_raster(R2DRaster* raster) noexcept { raster_ = raster; }
 
     void set_clip_rect(const R2DRect* rect) noexcept {
         if (!rect) {
@@ -629,25 +723,19 @@ struct R2DContext {
         plot_line_to(v1.x + nx, v1.y + ny);
         plot_line_to(v0.x + nx, v0.y + ny);
         plot_line_to(v0.x - nx, v0.y - ny);
-        plot_close();
+        plot_end();
     }
 
     void add_polygon(const R2DPoint* verts, size_t count, size_t first_vertex = 0) {
         if (count < 3)
             return;
         verts += first_vertex;
-        double first_x = (double)verts[0].x * 256.0;
-        double first_y = (double)verts[0].y * 256.0;
-        R2DFixed32 x0 = r2d_iround(first_x);
-        R2DFixed32 y0 = r2d_iround(first_y);
+        plot_move_to(verts[0].x, verts[0].y);
         for (size_t i = 1; i < count; i++) {
-            R2DFixed32 x1 = r2d_iround((double)verts[i].x * 256.0);
-            R2DFixed32 y1 = r2d_iround((double)verts[i].y * 256.0);
-            add_edge(x0, y0, x1, y1);
-            x0 = x1;
-            y0 = y1;
+            plot_line_to(verts[i].x, verts[i].y);
         }
-        add_edge(x0, y0, (int)first_x, (int)first_y);
+        plot_line_to(verts[0].x, verts[0].y);
+        plot_end();
     }
 
     void add_polygon_indexed(const R2DPoint* verts, const uint32_t* index, size_t index_count,
@@ -858,7 +946,7 @@ struct R2DContext {
                 }
                 plot_line_to(x1 + nx1, y1 + ny1);
                 plot_line_to(x1 - nx1, y1 - ny1);
-                plot_close();
+                plot_end();
                 break;
             }
             case R2DLineJoin::Bevel: {
@@ -881,126 +969,155 @@ struct R2DContext {
         clip_stack_pos = 0;
     }
 
-    bool plot_line_to(float x, float y) noexcept {
+    void plot_line_to(float x, float y) noexcept {
         uint32_t p1_clip = r2d_clipping_flag(x, y, clip_box_);
         bool p1_inside = p1_clip == 0;
+        float dx = x - px0;
+        float dy = y - py0;
+        float slope_y = dx / dy;
+        uint32_t clip_flags = (p0_clip & 5) | ((p1_clip & 5) << 1);
 
-        if (!(p0_clip || p1_clip)) {
-            add_edge(px0, py0, x, y);
+        if (clip_flags == 0) {
+            add_edge_y_clip(px0, py0, x, y, slope_y, p0_clip, p1_clip);
             px0 = x;
             py0 = y;
             p0_clip = p1_clip;
             p0_inside = p1_inside;
-            return false;
+            return;
         }
 
-        if (p0_clip & p1_clip & 1) {
-            px0 = x;
-            py0 = y;
-            p0_clip = p1_clip;
-            p0_inside = p1_inside;
-            return true;
-        }
-
-        float dx = px0 - x;
-        float dy = py0 - y;
-        float slope = (py0 - y) / (px0 - x);
-
-        if (p0_clip & R2D_CLIP_X0) {
-            float intersect_x = clip_box_.x0;
-            float intersect_y = (clip_box_.x0 - px0) * slope + py0;
-
-            /*if (clip_stack_pos > 0 && p0_inside && !p1_inside) {
-                R2DPoint& last_intersect = clip_stack[--clip_stack_pos];
-                add_edge(last_intersect.x, last_intersect.y, intersect_x, intersect_y);
-            }*/
-
-            add_edge(intersect_x, intersect_y, x, y);
-
-            R2DPoint& intersect = clip_stack[clip_stack_pos++];
-            intersect.x = intersect_x;
-            intersect.y = intersect_y;
-        } else if (p1_clip & R2D_CLIP_X0) {
-            float intersect_x = clip_box_.x0;
-            float intersect_y = (clip_box_.x0 - px0) * slope + py0;
-
-            add_edge(px0, py0, intersect_x, intersect_y);
-
-            if (clip_stack_pos > 0) {
-                R2DPoint& last_intersect = clip_stack[--clip_stack_pos];
-                add_edge(intersect_x, intersect_y, last_intersect.x, last_intersect.y);
-            } else {
-                R2DPoint& intersect = clip_stack[clip_stack_pos++];
-                intersect.x = intersect_x;
-                intersect.y = intersect_y;
+        float slope_x = dy / dx;
+        switch (clip_flags) {
+            case 1: { // p0_clip & R2D_CLIP_X0
+                float intersect_x = clip_box_.x0;
+                float intersect_y = (clip_box_.x0 - px0) * slope_x + py0;
+                uint32_t p2_clip = r2d_clipping_flag_y(intersect_y, clip_box_);
+                if (clip_x0_.flag & R2D_CLIP_X0) {
+                    add_edge_y_clip(clip_x0_.x, clip_x0_.y, intersect_x, intersect_y, 0.0f,
+                                    clip_x0_.flag, p2_clip);
+                    clip_x0_.flag = 0;
+                } else {
+                    clip_x0_.x = intersect_x;
+                    clip_x0_.y = intersect_y;
+                    clip_x0_.flag = p2_clip | R2D_CLIP_X0;
+                }
+                add_edge_y_clip(intersect_x, intersect_y, x, y, slope_y, p2_clip, p1_clip);
+                break;
             }
-        } else if (p0_clip & R2D_CLIP_X1) {
-            float intersect_x = clip_box_.x1;
-            float intersect_y = (clip_box_.x1 - px0) * slope + py0;
-
-            add_edge(intersect_x, intersect_y, x, y);
-
-            R2DPoint& intersect = clip_stack[clip_stack_pos++];
-            intersect.x = intersect_x;
-            intersect.y = intersect_y;
-        } else if (p1_clip & R2D_CLIP_X1) {
-            float intersect_x = clip_box_.x1;
-            float intersect_y = (clip_box_.x1 - px0) * slope + py0;
-
-            add_edge(px0, py0, intersect_x, intersect_y);
-
-            if (clip_stack_pos > 0) {
-                R2DPoint& last_intersect = clip_stack[--clip_stack_pos];
-                add_edge(intersect_x, intersect_y, last_intersect.x, last_intersect.y);
-            } else {
-                R2DPoint& intersect = clip_stack[clip_stack_pos++];
-                intersect.x = intersect_x;
-                intersect.y = intersect_y;
+            case 2: { // p1_clip & R2D_CLIP_X0
+                float intersect_x = clip_box_.x0;
+                float intersect_y = (clip_box_.x0 - px0) * slope_x + py0;
+                uint32_t p2_clip = r2d_clipping_flag_y(intersect_y, clip_box_);
+                add_edge_y_clip(px0, py0, intersect_x, intersect_y, slope_y, p0_clip, p2_clip);
+                if (clip_x0_.flag & R2D_CLIP_X0) {
+                    add_edge_y_clip(intersect_x, intersect_y, clip_x0_.x, clip_x0_.y, 0.0f, p2_clip,
+                                    clip_x0_.flag);
+                    clip_x0_.flag = 0;
+                } else {
+                    clip_x0_.x = intersect_x;
+                    clip_x0_.y = intersect_y;
+                    clip_x0_.flag = p2_clip | R2D_CLIP_X0;
+                }
+                break;
             }
-        } else if ((p0_clip & R2D_CLIP_X0) && (p1_clip & R2D_CLIP_X1)) {
-            float intersect_x0 = clip_box_.x0;
-            float intersect_x1 = clip_box_.x1;
-            float intersect_y0 = (clip_box_.x0 - px0) * slope + py0;
-            float intersect_y1 = (clip_box_.x1 - px0) * slope + py0;
-
-            add_edge(intersect_x0, intersect_y0, intersect_x1, intersect_y1);
-
-            R2DPoint& intersect = clip_stack[clip_stack_pos++];
-            intersect.x = intersect_x0;
-            intersect.y = intersect_y0;
-
-            intersect = clip_stack[clip_stack_pos++];
-            intersect.x = intersect_x1;
-            intersect.y = intersect_y1;
-        } else if ((p0_clip & R2D_CLIP_X1) && (p1_clip & R2D_CLIP_X0)) {
-            float intersect_x0 = clip_box_.x0;
-            float intersect_x1 = clip_box_.x1;
-            float intersect_y0 = (clip_box_.x0 - px0) * slope + py0;
-            float intersect_y1 = (clip_box_.x1 - px0) * slope + py0;
-
-            add_edge(intersect_x0, intersect_y0, intersect_x1, intersect_y1);
-
-            switch (clip_stack_pos) {
-                case 1: {
-                    R2DPoint& last_intersect = clip_stack[--clip_stack_pos];
-                    add_edge(last_intersect.x, last_intersect.y, intersect_x0, intersect_y0);
-                    break;
+            case 4: { // p0_clip & R2D_CLIP_X1
+                float intersect_x = clip_box_.x1;
+                float intersect_y = (clip_box_.x1 - px0) * slope_x + py0;
+                uint32_t p2_clip = r2d_clipping_flag_y(intersect_y, clip_box_);
+                if (clip_x1_.flag & R2D_CLIP_X1) {
+                    add_edge_y_clip(clip_x1_.x, clip_x1_.y, intersect_x, intersect_y, 0.0f,
+                                    clip_x1_.flag, p2_clip);
+                    clip_x1_.flag = 0;
+                } else {
+                    clip_x1_.x = intersect_x;
+                    clip_x1_.y = intersect_y;
+                    clip_x1_.flag = p2_clip | R2D_CLIP_X1;
                 }
-                case 2: {
-                    R2DPoint& last_intersect = clip_stack[--clip_stack_pos];
-                    add_edge(last_intersect.x, last_intersect.y, intersect_x0, intersect_y0);
-                    last_intersect = clip_stack[--clip_stack_pos];
-                    add_edge(intersect_x1, intersect_y1, last_intersect.x, last_intersect.y);
-                    break;
+                add_edge_y_clip(intersect_x, intersect_y, x, y, slope_y, p2_clip, p1_clip);
+                break;
+            }
+            case 6: { // (p1_clip & R2D_CLIP_X0) && (p0_clip & R2D_CLIP_X1)
+                float intersect_x0 = clip_box_.x0;
+                float intersect_x1 = clip_box_.x1;
+                float intersect_y0 = (clip_box_.x0 - px0) * slope_x + py0;
+                float intersect_y1 = (clip_box_.x1 - px0) * slope_x + py0;
+                uint32_t p2_clip = r2d_clipping_flag_y(intersect_y0, clip_box_);
+                uint32_t p3_clip = r2d_clipping_flag_y(intersect_y1, clip_box_);
+
+                if (clip_x1_.flag & R2D_CLIP_X1) {
+                    add_edge_y_clip(clip_x1_.x, clip_x1_.y, intersect_x1, intersect_y1, 0.0f,
+                                    clip_x1_.flag, p3_clip);
+                    clip_x1_.flag = 0;
+                } else {
+                    clip_x1_.x = intersect_x1;
+                    clip_x1_.y = intersect_y1;
+                    clip_x1_.flag = p3_clip | R2D_CLIP_X1;
                 }
-                default: {
-                    R2DPoint& intersect = clip_stack[clip_stack_pos++];
-                    intersect.x = intersect_x0;
-                    intersect.y = intersect_y0;
-                    intersect = clip_stack[clip_stack_pos++];
-                    intersect.x = intersect_x1;
-                    intersect.y = intersect_y1;
+
+                add_edge_y_clip(intersect_x1, intersect_y1, intersect_x0, intersect_y0, slope_y,
+                                p3_clip, p2_clip);
+
+                if (clip_x0_.flag & R2D_CLIP_X0) {
+                    add_edge_y_clip(intersect_x0, intersect_y0, clip_x0_.x, clip_x0_.y, 0.0f,
+                                    p2_clip, clip_x0_.flag);
+                    clip_x0_.flag = 0;
+                } else {
+                    clip_x0_.x = intersect_x0;
+                    clip_x0_.y = intersect_y0;
+                    clip_x0_.flag = p2_clip | R2D_CLIP_X0;
                 }
+                break;
+            }
+            case 8: { // p1_clip & R2D_CLIP_X1
+                float intersect_x = clip_box_.x1;
+                float intersect_y = (clip_box_.x1 - px0) * slope_x + py0;
+                uint32_t p2_clip = r2d_clipping_flag_y(intersect_y, clip_box_);
+                add_edge_y_clip(px0, py0, intersect_x, intersect_y, slope_y, p0_clip, p2_clip);
+                if (clip_x1_.flag & R2D_CLIP_X1) {
+                    add_edge_y_clip(intersect_x, intersect_y, clip_x1_.x, clip_x1_.y, 0.0f, p2_clip,
+                                    clip_x1_.flag);
+                    clip_x1_.flag = 0;
+                } else {
+                    clip_x1_.x = intersect_x;
+                    clip_x1_.y = intersect_y;
+                    clip_x1_.flag = p2_clip | R2D_CLIP_X1;
+                }
+                break;
+            }
+            case 9: { // (p0_clip & R2D_CLIP_X0) && (p1_clip & R2D_CLIP_X1)
+                float intersect_x0 = clip_box_.x0;
+                float intersect_x1 = clip_box_.x1;
+                float intersect_y0 = (clip_box_.x0 - px0) * slope_x + py0;
+                float intersect_y1 = (clip_box_.x1 - px0) * slope_x + py0;
+                uint32_t p2_clip = r2d_clipping_flag_y(intersect_y0, clip_box_);
+                uint32_t p3_clip = r2d_clipping_flag_y(intersect_y1, clip_box_);
+
+                if (clip_x0_.flag & R2D_CLIP_X0) {
+                    add_edge_y_clip(clip_x0_.x, clip_x0_.y, intersect_x0, intersect_y0, 0.0f,
+                                    clip_x0_.flag, p2_clip);
+                    clip_x0_.flag = 0;
+                } else {
+                    clip_x0_.x = intersect_x0;
+                    clip_x0_.y = intersect_y0;
+                    clip_x0_.flag = p2_clip | R2D_CLIP_X0;
+                }
+
+                add_edge_y_clip(intersect_x0, intersect_y0, intersect_x1, intersect_y1, slope_y,
+                                p2_clip, p3_clip);
+
+                if (clip_x1_.flag & R2D_CLIP_X1) {
+                    add_edge_y_clip(intersect_x1, intersect_y1, clip_x1_.x, clip_x1_.y, 0.0f,
+                                    p3_clip, clip_x1_.flag);
+                    clip_x1_.flag = 0;
+                } else {
+                    clip_x1_.x = intersect_x1;
+                    clip_x1_.y = intersect_y1;
+                    clip_x1_.flag = p3_clip | R2D_CLIP_X1;
+                }
+                break;
+            }
+            default: {
+                break;
             }
         }
 
@@ -1008,25 +1125,61 @@ struct R2DContext {
         py0 = y;
         p0_clip = p1_clip;
         p0_inside = p1_inside;
-
-        return true;
     }
 
-    inline void plot_close() noexcept {
-        if (clip_stack_pos > 0) {
-            R2DPoint& last_intersect0 = clip_stack[--clip_stack_pos];
-            R2DPoint& last_intersect1 = clip_stack[--clip_stack_pos];
-            add_edge(last_intersect1.x, last_intersect1.y, last_intersect0.x, last_intersect0.y);
-        }
+    inline void plot_end() noexcept {
+        clip_x0_ = {};
+        clip_x1_ = {};
     }
 
     // Add an edge to the raster
+    inline void add_edge_y_clip(float x0, float y0, float x1, float y1, float slope_y,
+                                uint32_t p0_clip, uint32_t p1_clip) noexcept {
+        p0_clip &= 10;
+        p1_clip &= 10;
+
+        if ((p0_clip | p1_clip) == 0) {
+            add_edge(x0, y0, x1, y1);
+        } else {
+            if (p0_clip == p1_clip) {
+                return;
+            }
+
+            float clip_x0 = x0;
+            float clip_y0 = y0;
+            float clip_x1 = x1;
+            float clip_y1 = y1;
+
+            if (p0_clip & 2) {
+                clip_x0 = x0 + (clip_box_.y0 - y0) * slope_y;
+                clip_y0 = clip_box_.y0;
+            }
+
+            if (p0_clip & 8) {
+                clip_x0 = x0 + (clip_box_.y1 - y0) * slope_y;
+                clip_y0 = clip_box_.y1;
+            }
+
+            if (p1_clip & 2) {
+                clip_x1 = x0 + (clip_box_.y0 - y0) * slope_y;
+                clip_y1 = clip_box_.y0;
+            }
+
+            if (p1_clip & 8) {
+                clip_x1 = x0 + (clip_box_.y1 - y0) * slope_y;
+                clip_y1 = clip_box_.y1;
+            }
+
+            add_edge(clip_x0, clip_y0, clip_x1, clip_y1);
+        }
+    }
+
     inline void add_edge(float x0, float y0, float x1, float y1) noexcept {
-        R2DFixed32 ix0 = r2d_iround((double)x0 * 256.0);
-        R2DFixed32 iy0 = r2d_iround((double)y0 * 256.0);
-        R2DFixed32 ix1 = r2d_iround((double)x1 * 256.0);
-        R2DFixed32 iy1 = r2d_iround((double)y1 * 256.0);
-        add_edge(ix0, iy0, ix1, iy1);
+        R2DFixed32 qx0 = r2d_iround((double)x0 * 256.0);
+        R2DFixed32 qy0 = r2d_iround((double)y0 * 256.0);
+        R2DFixed32 qx1 = r2d_iround((double)x1 * 256.0);
+        R2DFixed32 qy1 = r2d_iround((double)y1 * 256.0);
+        add_edge(qx0, qy0, qx1, qy1);
     }
 
     void add_edge(R2DFixed32 x0, R2DFixed32 y0, R2DFixed32 x1, R2DFixed32 y1) noexcept {
@@ -1054,6 +1207,27 @@ struct R2DContext {
 
         int inc_y = 1;
         int sign = 1;
+        int ex0 = x0 >> aa_shift;
+        int ex1 = x1 >> aa_shift;
+        int ey0 = y0 >> aa_shift;
+        int ey1 = y1 >> aa_shift;
+
+        if (ex0 < raster_->min_x_)
+            raster_->min_x_ = ex0;
+        if (ex0 > raster_->max_x_)
+            raster_->max_x_ = ex0;
+        if (ey0 < raster_->min_y_)
+            raster_->min_y_ = ey0;
+        if (ey0 > raster_->max_y_)
+            raster_->max_y_ = ey0;
+        if (ex1 < raster_->min_x_)
+            raster_->min_x_ = ex1;
+        if (ex1 > raster_->max_x_)
+            raster_->max_x_ = ex1;
+        if (ey1 < raster_->min_y_)
+            raster_->min_y_ = ey1;
+        if (ey1 > raster_->max_y_)
+            raster_->max_y_ = ey1;
 
         if (x0 > x1) {
             int tmp_x = x1;
@@ -1136,6 +1310,7 @@ struct R2DContext {
             return;
         }
 
+        // Line preparation formula based on Petr Kobalicek's Blend2D reference rasterizer 
         int base_x = aa_scale * dx;
         int lift_x = base_x / dy;
         int rem_x = base_x % dy;
@@ -1167,7 +1342,7 @@ struct R2DContext {
                 if (scanline_count == 0) {
                     delta_x = x1 - ((ix0 << aa_shift) + acc_fx);
                     fy1 = y1 & aa_mask;
-                    if (delta_x == 0)
+                    if (fy1 == 0)
                         continue;
                 }
 
@@ -1288,6 +1463,8 @@ struct R2DContext {
                 if (scanline_count == 0) {
                     delta_x = x1 - ((ix0 << aa_shift) + acc_fx);
                     fy1 = y1 & aa_mask;
+                    if (fy1 == 0)
+                        continue;
                 }
 
                 int next_fx = acc_fx + delta_x;
@@ -1397,7 +1574,7 @@ struct R2DContext {
             rt_->clear_raw(color);
             return;
         }
-        R2DColorBitPos rgba_bitpos = color_bitpos_(format);
+        R2DColorBitShift rgba_bitpos = r2d_color_bitshift(format);
         uint32_t r = (color >> rgba_bitpos.r) & 0xFF;
         uint32_t g = (color >> rgba_bitpos.g) & 0xFF;
         uint32_t b = (color >> rgba_bitpos.b) & 0xFF;
@@ -1433,10 +1610,18 @@ struct R2DContext {
             return;
         if (++raster_->current_gen_ == 0)
             raster_->clear();
+        raster_->min_x_ = raster_->width_;
+        raster_->min_y_ = raster_->height_;
+        raster_->max_x_ = 0;
+        raster_->max_y_ = 0;
     }
 
     template <typename BlendFnT>
     void render_raster_solid() {
+        assert(source_ && "Source color is not specified");
+        assert(rt_ && "Render target is not specified");
+        assert(raster_ && "Raster is not specified");
+
         BlendFnT blend_fn{};
         R2DColor8 src = source_->solid;
         uint32_t src_color = 0xFFFFFF & src;
@@ -1452,13 +1637,17 @@ struct R2DContext {
         uint32_t bitpos_g = rt_bitpos_.g;
         uint32_t bitpos_b = rt_bitpos_.b;
         uint32_t bitpos_a = rt_bitpos_.a;
+        int32_t raster_min_x = raster_->min_x_;
+        int32_t raster_min_y = raster_->min_y_;
+        int32_t raster_max_x = r2d_min(raster_->max_x_ + 1, (int32_t)render_width);
+        int32_t raster_max_y = r2d_min(raster_->max_y_ + 1, (int32_t)render_height);
 
-        for (uint32_t y = 0; y < render_height; y++) {
+        for (int32_t y = raster_min_y; y < raster_max_y; y++) {
             R2DColor8* image_row = &image_data[y * rt_width];
             R2DCell* raster_row = &cells[y * raster_stride];
             int effective_cover = 0;
 
-            for (uint32_t x = 0; x < render_width; x++) {
+            for (int32_t x = raster_min_x; x < raster_max_x; x++) {
                 R2DCell* cell = raster_row + x;
                 R2DColor8 dst = image_row[x];
                 int cover = 0;
@@ -1509,7 +1698,7 @@ struct R2DContext {
         plot_line_to(x1, y1);
         plot_line_to(x, y1);
         plot_line_to(x, y);
-        plot_close();
+        plot_end();
         render_raster();
         discard_raster();
     }
@@ -1519,7 +1708,7 @@ struct R2DContext {
         plot_line_to(v1.x, v1.y);
         plot_line_to(v2.x, v2.y);
         plot_line_to(v0.x, v0.y);
-        plot_close();
+        plot_end();
         render_raster();
         discard_raster();
     }
@@ -1551,21 +1740,5 @@ struct R2DContext {
         add_polyline(verts, count, first_vertex, close);
         render_raster();
         discard_raster();
-    }
-
-    R2D_FORCEINLINE
-    constexpr R2DColorBitPos color_bitpos_(R2DPixelFormat format) noexcept {
-        // Color bit position table for format conversion
-        switch (format) {
-            case R2DPixelFormat::RGBA8:
-                return {0, 8, 16, 24};
-            case R2DPixelFormat::ARGB8:
-                return {8, 16, 24, 0};
-            case R2DPixelFormat::BGRA8:
-                return {8, 16, 24, 0};
-            default:
-                R2D_UNREACHABLE();
-        }
-        return {};
     }
 };
